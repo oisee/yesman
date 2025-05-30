@@ -1,2 +1,18 @@
+# Core dependencies
 rich>=13.0.0
+requests>=2.25.0
+
+# Optional LLM provider dependencies
+# Install only what you need:
+
+# For OpenAI support
 openai>=1.0.0
+
+# For Anthropic support  
+# anthropic>=0.8.0
+
+# For Groq support
+# groq>=0.4.0
+
+# For development/testing
+# pytest>=7.0.0
