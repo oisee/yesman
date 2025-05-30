@@ -307,9 +307,9 @@ RECOMMENDED_MODELS = {
         "best": "gpt-4o"
     },
     "ollama": {
-        "fast": "phi4-mini:latest",      # Very fast, small model
-        "balanced": "phi4:latest",       # Good balance for this task
-        "best": "mistral-small:latest"   # Higher quality, still fast
+        "fast": "qwen3:4b",              # Fast and smart
+        "balanced": "phi4-mini:latest",  # Balanced option
+        "best": "devstral:latest"        # Best quality for coding tasks
     },
     "anthropic": {
         "fast": "claude-3-haiku-20240307",
@@ -336,7 +336,7 @@ def create_provider(provider_name: str, model: str = None, **kwargs) -> LLMProvi
     if provider_name == "openai":
         return OpenAIProvider(model=model or "gpt-3.5-turbo", **kwargs)
     elif provider_name == "ollama":
-        return OllamaProvider(model=model or "phi4:latest", **kwargs)
+        return OllamaProvider(model=model or "qwen3:4b", **kwargs)
     elif provider_name == "anthropic":
         return AnthropicProvider(model=model or "claude-3-haiku-20240307", **kwargs)
     elif provider_name == "groq":
@@ -369,8 +369,8 @@ def auto_select_provider() -> Optional[LLMProvider]:
         try:
             if provider_name == "ollama":
                 # Try different models for Ollama in order of preference
-                for model in ["phi4-mini:latest", "phi4:latest", "mistral-small:latest", 
-                             "qwen3:4b", "qwen3:latest", "deepseek-coder:latest"]:
+                for model in ["qwen3:4b", "phi4-mini:latest", "devstral:latest", 
+                             "qwen3:latest", "deepseek-coder:latest", "phi4:latest"]:
                     try:
                         provider = create_provider(provider_name, model=model)
                         if provider.is_available():
@@ -651,16 +651,20 @@ class YesMan:
             return self.response_cache[context_hash]
             
         # Optimized prompt for terminal automation
-        prompt = f"""Terminal automation task: A program is waiting for input.
+        prompt = f"""Terminal automation: The program is asking for input to CONTINUE execution.
+
 Output: {context}
 
-Respond with ONLY the exact input needed (y/n/1/2/ENTER/etc). Examples:
-- "Continue? [Y/n]" → y
-- "Press ENTER" → ENTER  
-- "Choose (1/2/3)" → 1
-- Uncertain → ENTER
+Respond with the SINGLE CHARACTER or WORD that allows the program to continue (usually "y", "yes", "1", or "ENTER").
 
-Response:"""
+Rules:
+- [Y/n] means Y is default → respond: y
+- [y/N] means yes to continue → respond: y  
+- (yes/no) → respond: yes
+- Press ENTER → respond: ENTER
+- Choose 1/2/3 → respond: 1
+
+Only output the exact input needed:"""
 
         try:
             response = self.llm_provider.generate(
@@ -671,10 +675,32 @@ Response:"""
             )
             
             if response.error:
-                self.status_text = f"LLM Error: {response.error[:30]}..."
+                self.status_text = f"LLM Error: {response.error[:50]}..."
                 return None
             
             result = response.content
+            
+            # Clean up thinking model outputs (remove <think>...</think> tags)
+            if '<think>' in result:
+                # Extract content after </think> tag
+                import re
+                # Remove everything from <think> to </think>
+                cleaned = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL)
+                # If nothing left, try to extract after think tags
+                if not cleaned.strip():
+                    # Look for content after </think>
+                    think_end = result.find('</think>')
+                    if think_end != -1:
+                        cleaned = result[think_end + 8:].strip()
+                    else:
+                        # Fallback: just remove <think> start
+                        cleaned = re.sub(r'<think>.*', '', result, flags=re.DOTALL).strip()
+                
+                if cleaned.strip():
+                    result = cleaned.strip()
+                else:
+                    # If we can't extract meaningful content, return a safe default
+                    result = "y"
             
             # Cache the response
             self.response_cache[context_hash] = result
