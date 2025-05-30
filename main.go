@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -68,7 +69,7 @@ var (
 
 type model struct {
 	command         []string
-	outputBuffer    []string
+	outputLines     []string
 	statusText      string
 	width           int
 	height          int
@@ -106,13 +107,15 @@ func initialModel(command []string, mode Mode, pauseDuration time.Duration) mode
 
 	return model{
 		command:       command,
-		outputBuffer:  []string{},
+		outputLines:   []string{},
 		statusText:    "Starting...",
 		outputChan:    make(chan string, 100),
 		llmClient:     client,
 		lastLLMCheck:  time.Now(),
 		mode:          mode,
 		pauseDuration: pauseDuration,
+		width:         80,  // Default width
+		height:        24,  // Default height
 	}
 }
 
@@ -149,7 +152,7 @@ func (m *model) startPTY() tea.Cmd {
 }
 
 func (m *model) readPTYOutput() {
-	buf := make([]byte, 4096)
+	buf := make([]byte, 1024)
 	for {
 		n, err := m.ptyFile.Read(buf)
 		if err != nil {
@@ -191,11 +194,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			if m.isPaused && m.llmSuggestion != "" {
-				m.sendInput(m.llmSuggestion)
+				suggestion := m.llmSuggestion
+				m.sendInput(suggestion)
 				m.isPaused = false
 				m.llmSuggestion = ""
 				m.detectedPrompt = ""
-				m.statusText = fmt.Sprintf("Sent: %s", m.llmSuggestion)
+				m.statusText = fmt.Sprintf("Sent: %s", suggestion)
 			}
 		case "esc":
 			if m.isPaused {
@@ -223,12 +227,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		select {
 		case output, ok := <-m.outputChan:
 			if ok {
-				m.mu.Lock()
-				m.outputBuffer = append(m.outputBuffer, output)
-				if len(m.outputBuffer) > maxBufferLines {
-					m.outputBuffer = m.outputBuffer[len(m.outputBuffer)-maxBufferLines:]
-				}
-				m.mu.Unlock()
+				m.processOutput(output)
 				
 				// Check for questions
 				if m.mode != ModeManual && m.detectQuestion() && time.Since(m.lastLLMCheck) > 2*time.Second {
@@ -288,25 +287,47 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *model) processOutput(output string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	// Split output into lines
+	lines := strings.Split(output, "\n")
+	
+	for i, line := range lines {
+		if i == 0 && len(m.outputLines) > 0 {
+			// Append to last line if output didn't start with newline
+			m.outputLines[len(m.outputLines)-1] += line
+		} else {
+			// Add as new line
+			if line != "" || i > 0 { // Keep empty lines except first
+				m.outputLines = append(m.outputLines, line)
+			}
+		}
+	}
+	
+	// Keep buffer size manageable
+	if len(m.outputLines) > maxBufferLines {
+		m.outputLines = m.outputLines[len(m.outputLines)-maxBufferLines:]
+	}
+}
+
 func (m *model) detectQuestion() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	
-	// Get recent output
-	recentOutput := strings.Join(m.outputBuffer, "")
-	lines := strings.Split(recentOutput, "\n")
-	
-	// Check last 5 lines
-	start := len(lines) - 5
+	// Get recent lines
+	start := len(m.outputLines) - 5
 	if start < 0 {
 		start = 0
 	}
 	
-	lastLines := strings.Join(lines[start:], "\n")
-	lowerLines := strings.ToLower(lastLines)
+	recentLines := m.outputLines[start:]
+	combined := strings.Join(recentLines, "\n")
+	lowerCombined := strings.ToLower(combined)
 	
 	for _, pattern := range questionPatterns {
-		if pattern.MatchString(lowerLines) {
+		if pattern.MatchString(lowerCombined) {
 			return true
 		}
 	}
@@ -327,11 +348,11 @@ func (m *model) handleQuestion() tea.Cmd {
 		}
 		
 		m.mu.Lock()
-		context := m.getRecentContext()
+		recentContext := m.getRecentContext()
 		m.mu.Unlock()
 		
 		// Extract last few lines for prompt detection
-		lines := strings.Split(context, "\n")
+		lines := strings.Split(recentContext, "\n")
 		lastFew := lines
 		if len(lines) > 5 {
 			lastFew = lines[len(lines)-5:]
@@ -346,9 +367,12 @@ The following is currently shown:
 The application appears to be waiting for user input. 
 Analyze the output and determine what input should be provided.
 Respond with ONLY the exact input to send (e.g., 'y', 'n', '1', 'yes', or just 'ENTER' for pressing enter).
-If unsure, respond with 'ENTER'.`, context)
+If unsure, respond with 'ENTER'.`, recentContext)
 		
-		resp, err := m.llmClient.CreateChatCompletion(nil, openai.ChatCompletionRequest{
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		
+		resp, err := m.llmClient.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 			Model:       openai.GPT3Dot5Turbo,
 			Messages:    []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: prompt}},
 			Temperature: 0.1,
@@ -372,16 +396,13 @@ If unsure, respond with 'ENTER'.`, context)
 }
 
 func (m *model) getRecentContext() string {
-	// Get last N lines
-	allOutput := strings.Join(m.outputBuffer, "")
-	lines := strings.Split(allOutput, "\n")
-	
-	start := len(lines) - contextLines
+	// Already under lock from caller
+	start := len(m.outputLines) - contextLines
 	if start < 0 {
 		start = 0
 	}
 	
-	return strings.Join(lines[start:], "\n")
+	return strings.Join(m.outputLines[start:], "\n")
 }
 
 func (m *model) sendInput(input string) {
@@ -410,9 +431,10 @@ func (m model) View() string {
 	// Title with mode
 	title := titleStyle.Render(fmt.Sprintf("[%s] YesMan - Command: %s", modeStr, strings.Join(m.command, " ")))
 	
-	// Output
+	// Get output lines
 	m.mu.Lock()
-	outputText := strings.Join(m.outputBuffer, "")
+	lines := make([]string, len(m.outputLines))
+	copy(lines, m.outputLines)
 	m.mu.Unlock()
 	
 	// Calculate view height
@@ -430,13 +452,14 @@ func (m model) View() string {
 	}
 	
 	// Get visible lines
-	lines := strings.Split(outputText, "\n")
 	start := len(lines) - viewHeight
 	if start < 0 {
 		start = 0
 	}
 	
-	visibleOutput := strings.Join(lines[start:], "\n")
+	visibleLines := lines[start:]
+	visibleOutput := strings.Join(visibleLines, "\n")
+	
 	output := outputStyle.Width(m.width - 4).Height(viewHeight).Render(visibleOutput)
 	
 	// Build components
