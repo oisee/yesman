@@ -8,7 +8,8 @@ A smart terminal wrapper written in Go that monitors CLI application output and 
 - **Beautiful TUI** with Charm's BubbleTea framework
 - **Real-time pattern detection** for interactive prompts
 - **OpenAI integration** for intelligent responses
-- **Concurrent processing** with Go routines
+- **Simple control system** with just 4 shortcuts
+- **Configurable pause behavior** before auto-responses
 
 ## Prerequisites
 
@@ -80,4 +81,48 @@ make build
 
 ## Controls
 
-- `q` or `Ctrl+C`: Quit the application
+**Just 4 shortcuts to remember:**
+- `Space` - Pause automation (stop and wait for manual input)
+- `Enter` - Accept LLM suggestion and continue
+- `Esc` - Switch to manual mode (disable automation)
+- `?` - Show/hide help
+
+## Operating Modes
+
+### Default Mode (3 second pause)
+```bash
+./yesman ./install.sh
+```
+When a prompt is detected, shows countdown: "Auto-responding in 3s... Press Space to pause"
+
+### Auto Mode (no pause)
+```bash
+./yesman --auto npm install
+```
+Immediately responds to all prompts without pause
+
+### Manual Mode
+```bash
+./yesman --manual apt upgrade
+```
+No automation - you control everything
+
+### Custom Pause
+```bash
+./yesman --pause 5 ./configure
+```
+Wait 5 seconds before each auto-response
+
+## Pause Menu
+
+When you press Space during countdown:
+```
+┌─ Paused ──────────────────┐
+│ "Continue? [y/N]"         │
+│ LLM suggests: 'y'         │
+│                           │
+│ Enter: Accept             │
+│ Esc: Manual control       │
+│ Any key: Manual input     │
+└───────────────────────────┘
+```

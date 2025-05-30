@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +20,16 @@ import (
 const (
 	maxBufferLines = 1000
 	contextLines   = 20
+	defaultPause   = 3 * time.Second
+)
+
+// Operating modes
+type Mode int
+
+const (
+	ModeAuto Mode = iota
+	ModeManual
+	ModePaused
 )
 
 var (
@@ -56,25 +67,37 @@ var (
 )
 
 type model struct {
-	command      []string
-	outputBuffer []string
-	statusText   string
-	width        int
-	height       int
-	ptyFile      *os.File
-	cmd          *exec.Cmd
-	outputChan   chan string
-	llmClient    *openai.Client
-	lastLLMCheck time.Time
-	mu           sync.Mutex
-	quitting     bool
+	command         []string
+	outputBuffer    []string
+	statusText      string
+	width           int
+	height          int
+	ptyFile         *os.File
+	cmd             *exec.Cmd
+	outputChan      chan string
+	llmClient       *openai.Client
+	lastLLMCheck    time.Time
+	mu              sync.Mutex
+	quitting        bool
+	mode            Mode
+	pauseDuration   time.Duration
+	isPaused        bool
+	countdown       int
+	llmSuggestion   string
+	detectedPrompt  string
+	showHelp        bool
 }
 
 type outputMsg string
 type statusMsg string
 type tickMsg time.Time
+type countdownMsg int
+type llmResponseMsg struct {
+	suggestion string
+	prompt     string
+}
 
-func initialModel(command []string) model {
+func initialModel(command []string, mode Mode, pauseDuration time.Duration) model {
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	var client *openai.Client
 	if apiKey != "" {
@@ -82,12 +105,14 @@ func initialModel(command []string) model {
 	}
 
 	return model{
-		command:      command,
-		outputBuffer: []string{},
-		statusText:   "Starting...",
-		outputChan:   make(chan string, 100),
-		llmClient:    client,
-		lastLLMCheck: time.Now(),
+		command:       command,
+		outputBuffer:  []string{},
+		statusText:    "Starting...",
+		outputChan:    make(chan string, 100),
+		llmClient:     client,
+		lastLLMCheck:  time.Now(),
+		mode:          mode,
+		pauseDuration: pauseDuration,
 	}
 }
 
@@ -144,12 +169,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c":
 			m.quitting = true
 			if m.cmd != nil && m.cmd.Process != nil {
 				m.cmd.Process.Kill()
 			}
 			return m, tea.Quit
+		case "q":
+			if !m.isPaused {
+				m.quitting = true
+				if m.cmd != nil && m.cmd.Process != nil {
+					m.cmd.Process.Kill()
+				}
+				return m, tea.Quit
+			}
+		case " ":
+			if m.countdown > 0 {
+				m.isPaused = true
+				m.countdown = 0
+				m.statusText = "Paused - Press Enter to accept, Esc for manual control"
+			}
+		case "enter":
+			if m.isPaused && m.llmSuggestion != "" {
+				m.sendInput(m.llmSuggestion)
+				m.isPaused = false
+				m.llmSuggestion = ""
+				m.detectedPrompt = ""
+				m.statusText = fmt.Sprintf("Sent: %s", m.llmSuggestion)
+			}
+		case "esc":
+			if m.isPaused {
+				m.mode = ModeManual
+				m.isPaused = false
+				m.statusText = "Manual mode - automation disabled"
+			}
+		case "?":
+			m.showHelp = !m.showHelp
+		default:
+			if m.isPaused && len(msg.String()) == 1 {
+				// Any single key press sends that input
+				m.sendInput(msg.String())
+				m.isPaused = false
+				m.statusText = fmt.Sprintf("Manual input: %s", msg.String())
+			}
 		}
 
 	case tea.WindowSizeMsg:
@@ -169,9 +231,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mu.Unlock()
 				
 				// Check for questions
-				if m.detectQuestion() && time.Since(m.lastLLMCheck) > 2*time.Second {
+				if m.mode != ModeManual && m.detectQuestion() && time.Since(m.lastLLMCheck) > 2*time.Second {
 					m.lastLLMCheck = time.Now()
-					return m, m.handleQuestion()
+					if m.mode == ModeAuto && m.pauseDuration > 0 {
+						// Start countdown
+						m.countdown = int(m.pauseDuration.Seconds())
+						return m, tea.Batch(
+							m.handleQuestion(),
+							m.countdownCmd(),
+						)
+					} else {
+						// No pause, immediate response
+						return m, m.handleQuestion()
+					}
 				}
 			} else {
 				m.statusText = "Process completed"
@@ -185,6 +257,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case statusMsg:
 		m.statusText = string(msg)
+	
+	case countdownMsg:
+		if m.countdown > 0 && !m.isPaused {
+			m.countdown = int(msg)
+			if m.countdown > 0 {
+				m.statusText = fmt.Sprintf("Auto-responding in %ds... Press Space to pause", m.countdown)
+				return m, m.countdownCmd()
+			} else if m.llmSuggestion != "" {
+				// Countdown finished, auto-send
+				m.sendInput(m.llmSuggestion)
+				m.statusText = fmt.Sprintf("Auto-sent: %s", m.llmSuggestion)
+				m.llmSuggestion = ""
+				m.detectedPrompt = ""
+			}
+		}
+	
+	case llmResponseMsg:
+		m.llmSuggestion = msg.suggestion
+		m.detectedPrompt = msg.prompt
+		if m.countdown == 0 && m.mode == ModeAuto && m.pauseDuration == 0 {
+			// Immediate mode
+			m.sendInput(m.llmSuggestion)
+			m.statusText = fmt.Sprintf("Auto-sent: %s", m.llmSuggestion)
+			m.llmSuggestion = ""
+			m.detectedPrompt = ""
+		}
 	}
 
 	return m, nil
@@ -216,6 +314,12 @@ func (m *model) detectQuestion() bool {
 	return false
 }
 
+func (m *model) countdownCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return countdownMsg(m.countdown - 1)
+	})
+}
+
 func (m *model) handleQuestion() tea.Cmd {
 	return func() tea.Msg {
 		if m.llmClient == nil {
@@ -225,6 +329,14 @@ func (m *model) handleQuestion() tea.Cmd {
 		m.mu.Lock()
 		context := m.getRecentContext()
 		m.mu.Unlock()
+		
+		// Extract last few lines for prompt detection
+		lines := strings.Split(context, "\n")
+		lastFew := lines
+		if len(lines) > 5 {
+			lastFew = lines[len(lines)-5:]
+		}
+		promptText := strings.Join(lastFew, "\n")
 		
 		prompt := fmt.Sprintf(`You are watching a terminal application output. 
 The following is currently shown:
@@ -249,8 +361,10 @@ If unsure, respond with 'ENTER'.`, context)
 		
 		if len(resp.Choices) > 0 {
 			response := strings.TrimSpace(resp.Choices[0].Message.Content)
-			m.sendInput(response)
-			return statusMsg(fmt.Sprintf("Sent: %s", response))
+			return llmResponseMsg{
+				suggestion: response,
+				prompt:     promptText,
+			}
 		}
 		
 		return statusMsg("No LLM response")
@@ -287,21 +401,36 @@ func (m model) View() string {
 		return ""
 	}
 	
-	// Title
-	title := titleStyle.Render(fmt.Sprintf("YesMan TUI - Command: %s", strings.Join(m.command, " ")))
+	// Mode indicator
+	modeStr := "AUTO"
+	if m.mode == ModeManual {
+		modeStr = "MANUAL"
+	}
+	
+	// Title with mode
+	title := titleStyle.Render(fmt.Sprintf("[%s] YesMan - Command: %s", modeStr, strings.Join(m.command, " ")))
 	
 	// Output
 	m.mu.Lock()
 	outputText := strings.Join(m.outputBuffer, "")
 	m.mu.Unlock()
 	
-	// Get last lines that fit in view
-	lines := strings.Split(outputText, "\n")
-	viewHeight := m.height - 10 // Account for borders and status
+	// Calculate view height
+	baseHeight := 10
+	if m.showHelp {
+		baseHeight = 20
+	}
+	if m.isPaused {
+		baseHeight = 15
+	}
+	
+	viewHeight := m.height - baseHeight
 	if viewHeight < 5 {
 		viewHeight = 5
 	}
 	
+	// Get visible lines
+	lines := strings.Split(outputText, "\n")
 	start := len(lines) - viewHeight
 	if start < 0 {
 		start = 0
@@ -310,20 +439,83 @@ func (m model) View() string {
 	visibleOutput := strings.Join(lines[start:], "\n")
 	output := outputStyle.Width(m.width - 4).Height(viewHeight).Render(visibleOutput)
 	
-	// Status
-	status := statusStyle.Width(m.width - 4).Render(fmt.Sprintf("Status: %s", m.statusText))
+	// Build components
+	components := []string{title, output}
 	
-	return lipgloss.JoinVertical(lipgloss.Left, title, output, status)
+	// Pause menu
+	if m.isPaused && m.llmSuggestion != "" {
+		pauseBox := lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("226")).
+			Padding(1).
+			Width(m.width - 4).
+			Render(fmt.Sprintf("┌─ Paused ──────────────────┐\n│ %s\n│ LLM suggests: '%s'\n│\n│ Enter: Accept\n│ Esc: Manual control\n│ Any key: Manual input\n└───────────────────────────┘",
+				m.detectedPrompt, m.llmSuggestion))
+		components = append(components, pauseBox)
+	}
+	
+	// Help
+	if m.showHelp {
+		help := lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("241")).
+			Padding(1).
+			Width(m.width - 4).
+			Render("Controls:\n  Space - Pause automation\n  Enter - Accept LLM suggestion\n  Esc   - Manual mode\n  ?     - Toggle help\n  Ctrl+C - Quit")
+		components = append(components, help)
+	}
+	
+	// Status
+	statusText := m.statusText
+	if m.countdown > 0 && !m.isPaused {
+		statusText = fmt.Sprintf("Auto-responding in %ds... Press Space to pause", m.countdown)
+	}
+	
+	status := statusStyle.Width(m.width - 4).Render(statusText)
+	components = append(components, status)
+	
+	return lipgloss.JoinVertical(lipgloss.Left, components...)
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: yesman <command> [args...]")
-		fmt.Println("Example: yesman apt install htop")
+	var (
+		autoMode = flag.Bool("auto", false, "Full auto mode (no pause)")
+		manualMode = flag.Bool("manual", false, "Manual mode (no automation)")
+		pauseSec = flag.Int("pause", 3, "Pause duration in seconds before auto-response")
+	)
+	
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <command> [args...]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s ./install.sh                    # Default mode (3s pause)\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --auto npm install              # No pause\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --manual apt upgrade            # Manual control only\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --pause 5 ./configure           # 5 second pause\n", os.Args[0])
+	}
+	
+	flag.Parse()
+	
+	if flag.NArg() < 1 {
+		flag.Usage()
 		os.Exit(1)
 	}
 	
-	p := tea.NewProgram(initialModel(os.Args[1:]), tea.WithAltScreen())
+	// Determine mode
+	mode := ModeAuto
+	pauseDuration := time.Duration(*pauseSec) * time.Second
+	
+	if *manualMode {
+		mode = ModeManual
+		pauseDuration = 0
+	} else if *autoMode {
+		pauseDuration = 0
+	}
+	
+	command := flag.Args()
+	
+	p := tea.NewProgram(initialModel(command, mode, pauseDuration), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
