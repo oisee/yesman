@@ -82,9 +82,13 @@ class OpenAIProvider(LLMProvider):
 class OllamaProvider(LLMProvider):
     """Ollama local provider"""
     
-    def __init__(self, model: str = "llama3.2:3b", base_url: str = "http://localhost:11434"):
+    def __init__(self, model: str = "llama3.2:3b", base_url: str = None):
         self.model = model
+        # Check OLLAMA_HOST environment variable
+        if base_url is None:
+            base_url = os.getenv("OLLAMA_HOST", "http://localhost:11434")
         self.base_url = base_url.rstrip('/')
+        self.last_error = None
     
     def generate(self, prompt: str, **kwargs) -> LLMResponse:
         try:
@@ -105,19 +109,82 @@ class OllamaProvider(LLMProvider):
             if response.status_code == 200:
                 result = response.json()
                 content = result.get("response", "").strip()
+                self.last_error = None
                 return LLMResponse(content, provider=self.name, model=self.model)
+            elif response.status_code == 404:
+                error_detail = f"Model '{self.model}' not found. Try: ollama pull {self.model}"
+                self.last_error = error_detail
+                return LLMResponse("", error=error_detail, provider=self.name)
             else:
-                return LLMResponse("", error=f"HTTP {response.status_code}", provider=self.name)
+                error_detail = f"HTTP {response.status_code}: {response.text[:100]}"
+                self.last_error = error_detail
+                return LLMResponse("", error=error_detail, provider=self.name)
                 
+        except requests.exceptions.ConnectionError:
+            error_detail = f"Cannot connect to Ollama at {self.base_url}. Is Ollama running?"
+            self.last_error = error_detail
+            return LLMResponse("", error=error_detail, provider=self.name)
+        except requests.exceptions.Timeout:
+            error_detail = "Request timeout. Ollama might be busy."
+            self.last_error = error_detail
+            return LLMResponse("", error=error_detail, provider=self.name)
         except Exception as e:
-            return LLMResponse("", error=str(e), provider=self.name)
+            error_detail = f"Unexpected error: {str(e)}"
+            self.last_error = error_detail
+            return LLMResponse("", error=error_detail, provider=self.name)
     
     def is_available(self) -> bool:
         try:
             response = requests.get(f"{self.base_url}/api/tags", timeout=5.0)
-            return response.status_code == 200
-        except:
+            if response.status_code == 200:
+                # Check if the specified model is available
+                tags = response.json().get("models", [])
+                model_names = [model.get("name", "") for model in tags]
+                # Check for exact match or partial match (e.g., "llama3.2:3b" in "llama3.2:3b-instruct")
+                model_available = any(self.model in name or name.startswith(self.model) for name in model_names)
+                if not model_available:
+                    self.last_error = f"Model '{self.model}' not found in Ollama. Available: {', '.join(model_names[:3])}"
+                return model_available
+            else:
+                self.last_error = f"Ollama API returned {response.status_code}"
+                return False
+        except requests.exceptions.ConnectionError:
+            self.last_error = f"Cannot connect to Ollama at {self.base_url}"
             return False
+        except Exception as e:
+            self.last_error = f"Error checking Ollama: {str(e)}"
+            return False
+    
+    def get_diagnostic_info(self) -> str:
+        """Get diagnostic information for troubleshooting"""
+        info = []
+        info.append(f"Ollama URL: {self.base_url}")
+        info.append(f"Model: {self.model}")
+        
+        try:
+            # Test connection
+            response = requests.get(f"{self.base_url}/api/tags", timeout=5.0)
+            if response.status_code == 200:
+                tags = response.json().get("models", [])
+                model_names = [model.get("name", "") for model in tags]
+                info.append(f"✅ Connected to Ollama")
+                info.append(f"Available models: {', '.join(model_names)}")
+                
+                if not any(self.model in name for name in model_names):
+                    info.append(f"❌ Model '{self.model}' not found")
+                    info.append(f"💡 Try: ollama pull {self.model}")
+            else:
+                info.append(f"❌ HTTP {response.status_code}")
+        except requests.exceptions.ConnectionError:
+            info.append(f"❌ Cannot connect to {self.base_url}")
+            info.append(f"💡 Is Ollama running? Try: ollama serve")
+        except Exception as e:
+            info.append(f"❌ Error: {e}")
+            
+        if self.last_error:
+            info.append(f"Last error: {self.last_error}")
+            
+        return "\n".join(info)
     
     @property
     def name(self) -> str:
@@ -214,9 +281,9 @@ RECOMMENDED_MODELS = {
         "best": "gpt-4o"
     },
     "ollama": {
-        "fast": "llama3.2:1b",      # Very fast, good for this task
-        "balanced": "llama3.2:3b",  # Best balance of speed/quality
-        "best": "llama3.1:8b"       # Higher quality
+        "fast": "phi4-mini:latest",      # Very fast, small model
+        "balanced": "phi4:latest",       # Good balance for this task
+        "best": "mistral-small:latest"   # Higher quality, still fast
     },
     "anthropic": {
         "fast": "claude-3-haiku-20240307",
@@ -243,7 +310,7 @@ def create_provider(provider_name: str, model: str = None, **kwargs) -> LLMProvi
     if provider_name == "openai":
         return OpenAIProvider(model=model or "gpt-3.5-turbo", **kwargs)
     elif provider_name == "ollama":
-        return OllamaProvider(model=model or "llama3.2:3b", **kwargs)
+        return OllamaProvider(model=model or "phi4:latest", **kwargs)
     elif provider_name == "anthropic":
         return AnthropicProvider(model=model or "claude-3-haiku-20240307", **kwargs)
     elif provider_name == "groq":
@@ -274,9 +341,20 @@ def auto_select_provider() -> Optional[LLMProvider]:
     
     for provider_name in priority:
         try:
-            provider = create_provider(provider_name)
-            if provider.is_available():
-                return provider
+            if provider_name == "ollama":
+                # Try different models for Ollama in order of preference
+                for model in ["phi4-mini:latest", "phi4:latest", "mistral-small:latest", 
+                             "qwen3:4b", "qwen3:latest", "deepseek-coder:latest"]:
+                    try:
+                        provider = create_provider(provider_name, model=model)
+                        if provider.is_available():
+                            return provider
+                    except:
+                        continue
+            else:
+                provider = create_provider(provider_name)
+                if provider.is_available():
+                    return provider
         except:
             continue
     
