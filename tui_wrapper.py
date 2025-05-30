@@ -23,13 +23,14 @@ from rich.text import Text
 from rich.align import Align
 
 # For LLM integration
-import openai
+from openai import OpenAI
 import json
 
 class SmartTerminalWrapper:
     def __init__(self, command: list[str], llm_api_key: str = None):
         self.command = command
         self.llm_api_key = llm_api_key or os.getenv("OPENAI_API_KEY")
+        self.openai_client = OpenAI(api_key=self.llm_api_key) if self.llm_api_key else None
         self.output_buffer = []
         self.max_buffer_lines = 1000
         self.running = True
@@ -97,12 +98,10 @@ class SmartTerminalWrapper:
         
     def ask_llm(self, context: str) -> Optional[str]:
         """Ask LLM what to respond to the prompt"""
-        if not self.llm_api_key:
+        if not self.openai_client:
             return None
             
         try:
-            openai.api_key = self.llm_api_key
-            
             prompt = f"""You are watching a terminal application output. 
 The following is currently shown:
 
@@ -113,7 +112,7 @@ Analyze the output and determine what input should be provided.
 Respond with ONLY the exact input to send (e.g., 'y', 'n', '1', 'yes', or just 'ENTER' for pressing enter).
 If unsure, respond with 'ENTER'."""
 
-            response = openai.ChatCompletion.create(
+            response = self.openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
