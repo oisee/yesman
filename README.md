@@ -4,6 +4,50 @@
 
 YesMan is a TUI (Terminal User Interface) application that monitors CLI program output and automatically handles interactive prompts using Large Language Models. It shows your program's output in a terminal-in-terminal view while intelligently responding to questions and prompts.
 
+## 🤔 Why Do You Need This?
+
+**YesMan enables fully automated AI pair programming with visual oversight.**
+
+When using AI coding tools like Codex CLI or Claude Code, you constantly face interrupting prompts:
+
+- `"Apply this change? [Y/n]"`
+- `"Create new file? [Y/n]"`  
+- `"Run this command? [Y/n]"`
+- `"Continue with refactoring? [Y/n]"`
+- `"Install dependencies? [Y/n]"`
+
+**The Problem**: These safety prompts interrupt the AI's flow, requiring manual intervention every few seconds and defeating the purpose of automation.
+
+**The Solution**: YesMan acts as an intelligent supervisor that:
+
+### ✅ **Auto-Approves AI Suggestions**
+- Let Claude Code refactor entire codebases while you watch
+- Enable true "autopilot" coding sessions where AI completes full features
+- Remove friction from AI-driven development workflows
+
+### 👀 **Provides Full Visual Control** 
+- See exactly what the AI is doing in real-time
+- Pause or intervene at any moment with a single keypress
+- Terminal-in-terminal view shows all AI actions transparently
+
+### 🚀 **Enables Autonomous Development**
+- Run overnight AI-driven development sessions
+- Automate repetitive coding tasks with AI assistance
+- Build proof-of-concepts with minimal human intervention
+
+### 🛡️ **Maintains Safety**
+- Smart context-aware defaults for AI tool prompts
+- Manual override capability always available
+- Pause countdown before executing any action
+
+### 💡 **Perfect For AI Coding Workflows**
+- **Feature Development**: Let AI implement entire features while you supervise
+- **Codebase Refactoring**: Automated large-scale code improvements  
+- **Dependency Management**: AI handles package installations and updates
+- **Testing & CI**: Automated test writing and pipeline setup
+- **Documentation**: AI generates docs while handling all confirmations
+- **Code Reviews**: AI applies suggested changes across multiple files
+
 ![YesMan Demo](https://img.shields.io/badge/Status-Working-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.8+-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -91,18 +135,22 @@ export GROQ_API_KEY="your-api-key"
 - **p** - Show provider info
 - **d** - Show diagnostics
 
-### Real-World Examples
+### AI Coding Examples
 ```bash
-# System administration
-./yesman.py sudo apt upgrade
-./yesman.py ./install_docker.sh
+# Let Claude Code refactor entire codebase autonomously
+./yesman.py claude-code "refactor this React app to use TypeScript"
 
-# Development workflows
-./yesman.py npm create vue@latest my-project
-./yesman.py python setup.py install
+# Automated feature development with oversight
+./yesman.py codex "implement user authentication system"
 
-# Interactive installers
-./yesman.py ./configure && make && make install
+# AI-driven dependency management
+./yesman.py claude-code "update all packages and fix breaking changes"
+
+# Autonomous testing and CI setup
+./yesman.py --auto claude-code "add comprehensive tests for all components"
+
+# Full application scaffolding
+./yesman.py codex "create a complete CRUD API with database setup"
 ```
 
 ## 🔧 How It Works
